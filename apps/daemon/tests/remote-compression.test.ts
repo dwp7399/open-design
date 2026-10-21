@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import express from 'express';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -13,15 +16,21 @@ const LARGE_JSON = { items: Array.from({ length: 2000 }, (_, i) => ({ id: i, tit
 const LARGE_JS = `export const data = ${JSON.stringify(LARGE_JSON)};\n`;
 
 let server: http.Server | null = null;
+let staticDir: string | null = null;
 
 afterEach(async () => {
   await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
   server = null;
+  if (staticDir) rmSync(staticDir, { recursive: true, force: true });
+  staticDir = null;
 });
 
 async function startApp(remote: boolean): Promise<string> {
   const app = express();
   app.use(createRemoteCompressionMiddleware({ isLocalPeer: () => !remote }));
+  staticDir = mkdtempSync(path.join(tmpdir(), 'od-remote-compression-'));
+  writeFileSync(path.join(staticDir, 'chunk.js'), LARGE_JS);
+  app.use('/static', express.static(staticDir));
   app.get('/api/large', (_req, res) => res.json(LARGE_JSON));
   app.get('/api/small', (_req, res) => res.json({ ok: true }));
   app.get('/_next/static/app.js', (_req, res) => res.type('text/javascript').send(LARGE_JS));
@@ -40,6 +49,8 @@ async function startApp(remote: boolean): Promise<string> {
 }
 
 interface RawResponse {
+  status: number | undefined;
+  contentRange: string | undefined;
   encoding: string | undefined;
   vary: string | undefined;
   body: Buffer;
@@ -47,12 +58,12 @@ interface RawResponse {
   firstChunkMs: number;
 }
 
-function get(url: string): Promise<RawResponse> {
+function get(url: string, headers: Record<string, string> = {}): Promise<RawResponse> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     let firstChunkMs = -1;
     http
-      .get(url, { headers: { 'Accept-Encoding': 'gzip' } }, (res) => {
+      .get(url, { headers: { 'Accept-Encoding': 'gzip', ...headers } }, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => {
           if (firstChunkMs < 0) firstChunkMs = Date.now() - started;
@@ -60,6 +71,8 @@ function get(url: string): Promise<RawResponse> {
         });
         res.on('end', () =>
           resolve({
+            status: res.statusCode,
+            contentRange: res.headers['content-range'],
             encoding: res.headers['content-encoding'],
             vary: res.headers.vary,
             body: Buffer.concat(chunks),
@@ -106,6 +119,21 @@ describe('remote compression middleware', () => {
     // The first event must arrive before the handler ends the stream at 200ms;
     // a buffering compressor would hold it until end().
     expect(events.firstChunkMs).toBeLessThan(150);
+  });
+
+  it('never compresses a remote partial response, so the bytes match Content-Range', async () => {
+    const base = await startApp(true);
+
+    // A slice above the 1 KB threshold with an allowlisted type: compressing it
+    // would keep 206 + Content-Range while sending gzip bytes instead of the slice.
+    const slice = await get(`${base}/static/chunk.js`, { Range: 'bytes=0-2047' });
+    expect(slice.status).toBe(206);
+    expect(slice.contentRange).toBe(`bytes 0-2047/${Buffer.byteLength(LARGE_JS)}`);
+    expect(slice.encoding).toBeUndefined();
+    expect(slice.body.toString('utf8')).toBe(LARGE_JS.slice(0, 2048));
+
+    // The full file through the same static mount is still compressed.
+    expect((await get(`${base}/static/chunk.js`)).encoding).toBe('gzip');
   });
 
   it('skips content types outside the allowlist and bodies under the size threshold', async () => {

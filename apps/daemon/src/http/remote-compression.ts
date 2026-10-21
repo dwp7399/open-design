@@ -19,6 +19,9 @@ import { isLoopbackPeerAddress } from './local-daemon-request.js';
  * - Only an explicit allowlist of whole-document content types is compressed.
  *   Streaming responses (`text/event-stream` SSE, NDJSON, binary downloads)
  *   fall outside it, so compression can never buffer a live stream.
+ * - Partial responses (206 / `Content-Range`) are never compressed. The range
+ *   describes bytes of the uncompressed representation, so gzipping the slice
+ *   would hand the client bytes that no longer match it.
  */
 const COMPRESSIBLE_CONTENT_TYPES = new Set([
   'application/javascript',
@@ -35,6 +38,10 @@ export function isCompressibleContentType(contentType: unknown): boolean {
   return COMPRESSIBLE_CONTENT_TYPES.has(mediaType);
 }
 
+export function isPartialResponse(res: Response): boolean {
+  return res.statusCode === 206 || res.getHeader('Content-Range') !== undefined;
+}
+
 export interface RemoteCompressionOptions {
   /** Whether the request arrived from this machine. Tests inject a remote peer. */
   isLocalPeer?: (req: Request) => boolean;
@@ -48,6 +55,7 @@ export function createRemoteCompressionMiddleware(
   return compression({
     filter: (req, res) =>
       !isLocalPeer(req as Request)
+      && !isPartialResponse(res as Response)
       && isCompressibleContentType((res as Response).getHeader('Content-Type')),
   });
 }
