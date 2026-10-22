@@ -7,6 +7,7 @@
 // ready at ~0.7s, cover gone at ~11s for one 210 KB image served at 20 KB/s).
 
 import { act, cleanup, render, screen } from '@testing-library/react';
+import { useLayoutEffect } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { FileViewer } from '../../src/components/FileViewer';
@@ -38,13 +39,33 @@ function htmlArtifact(): ProjectFile {
   } as ProjectFile;
 }
 
+const GALLERY_HTML =
+  '<html><body><main>Gallery</main><video src="https://cdn.example/slow.mp4" autoplay muted></video></body></html>';
+
+/**
+ * Posts the artifact's DOM-ready signal from a layout effect that runs after
+ * FileViewer's own layout effects but before any passive effect: the window
+ * in which a fast document can report readiness while the iframe is still
+ * being attached and the cover has not been armed yet.
+ */
+function EmitDomReadyDuringAttach() {
+  useLayoutEffect(() => {
+    const frame = document.querySelector('[data-testid="artifact-preview-frame"]') as HTMLIFrameElement | null;
+    window.dispatchEvent(new MessageEvent('message', {
+      source: frame?.contentWindow ?? null,
+      data: { type: 'od:preview-scroll-request' },
+    }));
+  }, []);
+  return null;
+}
+
 function renderUrlLoadPreview() {
   render(
     <FileViewer
       projectId="first-load-reveal"
       projectKind="prototype"
       file={htmlArtifact()}
-      liveHtml={'<html><body><main>Gallery</main><video src="https://cdn.example/slow.mp4" autoplay muted></video></body></html>'}
+      liveHtml={GALLERY_HTML}
     />,
   );
   const frame = screen.getByTestId('artifact-preview-frame') as HTMLIFrameElement;
@@ -75,6 +96,27 @@ describe('URL-load first-load cover', () => {
       vi.advanceTimersByTime(1);
     });
     // No `load` event was ever dispatched: the subresources are still pending.
+    expect(screen.queryByTestId('artifact-preview-first-load')).toBeNull();
+  });
+
+  it('still lifts when the document reports DOM ready during frame attachment', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    render(
+      <>
+        <FileViewer
+          projectId="first-load-reveal-early"
+          projectKind="prototype"
+          file={htmlArtifact()}
+          liveHtml={GALLERY_HTML}
+        />
+        <EmitDomReadyDuringAttach />
+      </>,
+    );
+    // The signal arrived before the cover was armed; it must not be lost.
+    expect(screen.getByTestId('artifact-preview-first-load')).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(URL_PREVIEW_FIRST_LOAD_GRACE_MS);
+    });
     expect(screen.queryByTestId('artifact-preview-first-load')).toBeNull();
   });
 

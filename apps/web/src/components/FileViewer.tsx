@@ -12197,8 +12197,11 @@ function HtmlViewer({
       },
     });
   }
-  useEffect(() => {
-    if (!urlPreviewFirstLoadPending) return;
+  // Listen from mount, in a layout effect, so the listener exists before the
+  // iframe (assigned its src from layout effects below it) can navigate. A
+  // fast document may report DOM ready before the cover is armed; the
+  // scheduler remembers that instead of dropping it.
+  useLayoutEffect(() => {
     const scheduler = urlPreviewFirstLoadRevealRef.current!;
     function onArtifactDomReady(ev: MessageEvent) {
       const frameWindow = urlPreviewIframeRef.current?.contentWindow;
@@ -12209,8 +12212,16 @@ function HtmlViewer({
     window.addEventListener('message', onArtifactDomReady);
     return () => {
       window.removeEventListener('message', onArtifactDomReady);
-      scheduler.cancel();
+      scheduler.reset();
     };
+  }, []);
+  // A new URL or keep-alive key means a new document. Runs in the same commit
+  // that assigns the new src, so nothing the new document posts can precede it.
+  useLayoutEffect(() => {
+    urlPreviewFirstLoadRevealRef.current!.reset();
+  }, [urlFrameSrc, urlPreviewKeepAliveKey]);
+  useEffect(() => {
+    if (urlPreviewFirstLoadPending) urlPreviewFirstLoadRevealRef.current!.arm();
   }, [urlPreviewFirstLoadPending, urlFrameSrc, urlPreviewKeepAliveKey]);
   const activateSrcDocTransport = useCallback((target: HTMLIFrameElement | null = srcDocPreviewIframeRef.current) => {
     const activationInputs = {
